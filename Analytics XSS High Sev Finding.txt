@@ -1,0 +1,42 @@
+Analytics CX XSS finding support example ( also likely false positive based on initial research)
+
+The method .then embeds untrusted data in generated output with send, at line 53 of src\server\services\routes\features\13f-report.js. This untrusted data is embedded into the output without proper sanitization or encoding, enabling an attacker to inject malicious code into the generated web-page. The attacker would be able to alter the returned web page by simply providing modified data in the user input date, which is read by the _getFileName method at line 237 of src\server\services\routes\features\13f-report.js. This input then flows through the code straight to the output web page, without sanitization. This can enable a Reflected Cross-Site Scripting (XSS) attack. Similarity ID: -1797235729
+
+ 
+
+// line 237 snippet
+
+function _getFileName(req) {
+    let filename = '13F-Report';    try {
+        if (req.query.date) {
+            const formatted = _formatDate(req.query.date);
+            if (formatted) {
+                filename += '-' + formatted;
+            }
+        }        if (req.query.client) {
+            let cleanClientName = req.query.client;
+            cleanClientName = cleanClientName.replace(/[/\\?%*:|"<>,]/g, '');
+            filename += '-' + cleanClientName;
+        }
+    } catch (ignore) {}    filename += '.xlsx';    return sanitizeFilename(filename);
+}
+ 
+ 
+
+// line 53 snippet
+ WSRoutes.createGetRoute(serverContext, '/13freport', (req, res) => {
+    let funcCtx = '/13freport';
+    const startHash = createStartHash();    userLog(LOG_LEVELS.INFO, req, { msg: 'Initiating 13f report generation' }, startHash);    _generate13fReport(serverContext, req)
+        .then(response => {
+            userLog(LOG_LEVELS.INFO, req, { msg: '13f report generated successfully' }, startHash);            const filename = _getFileName(req);
+            res.setHeader('Content-Disposition', 'attachment; filename=' + filename);
+            res.setHeader(
+                'Content-type',
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            );            res.send(new Buffer(response));
+        })
+        .catch(error => {
+            const msg = 'Exception while generating 13f report';
+            handleError(serverContext, error, res, false, null, funcCtx, msg, req, startHash);
+        });
+});

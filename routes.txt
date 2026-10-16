@@ -1,0 +1,441 @@
+import { IDocs, IDocsDefinition, IDocsLink } from '@core/apigateway-types';
+import { IServerContext, WSLogger, WSRest, WSRestResponseType, WSRoutes, WSServer, WSServerUtils } from '@ws/ws-server';
+import * as fs from 'fs';
+import * as path from 'path';
+import { getAllContentDocuments, getSingleContentDocument, setHeadersForDownloadOrVisualization } from '../utils/distributionServiceUtils';
+import { compileContentDocumentMessageForAPIRequest, compileEmailMessageForAPIRequest, reportError, requestAccess } from './email';
+import { exec } from 'shelljs';
+import { isLocal } from '..';
+let serviceToken: string | undefined;
+const serviceUser: string = 'portal_server@itginc.com';
+
+export function register(serverContext: IServerContext) {
+    WSRoutes.createGetRoute(serverContext, '/endPoints', (req, res) => {
+        const isDemo = queryIsDemo(req);
+        // get service metadata.
+        getMetadata(serverContext, '/endPoints?type=external')
+            .then((serviceMetadata: any) => {
+                // now get user metadata
+                getMetadata(serverContext, '/endPoints?type=external', req)
+                    .then((userMetadata: any) => {
+                        const response = processEndpoints(serverContext, serviceMetadata, userMetadata, isDemo);
+                        res.send(response);
+                    })
+                    .catch(err => {
+                        res.send(err);
+                    });
+            })
+            .catch((err: any) => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createGetRoute(serverContext, '/contentDocuments', (req, res) => {
+        getAllContentDocuments(serverContext, req)
+            .then((response: any) => {
+                res.send(response.data);
+            })
+            .catch((err: any) => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createGetRoute(serverContext, '/downloadContentDocument/:documentId', (req, res) => {
+        getSingleContentDocument(serverContext, req, req.params.documentId)
+            .then((response: any) => {
+                setHeadersForDownloadOrVisualization(response, res, true);
+                res.send(response.data);
+            })
+            .catch((err: any) => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createGetRoute(serverContext, '/viewContentDocument/:documentId', (req, res) => {
+        getSingleContentDocument(serverContext, req, req.params.documentId)
+            .then((response: any) => {
+                setHeadersForDownloadOrVisualization(response, res);
+                res.send(response.data);
+            })
+            .catch((err: any) => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createPostRoute(serverContext, '/docs', (req, res) => {
+        const { endpoint, source, protocol } = req.body.data;
+        const query = protocol == '' ? '' : '?apiType=${protocol}';
+        const uri = '/docs/${source}/${endpoint}${query}';
+        getMetadata(serverContext, uri, req)
+            .then((metadata: any) => {
+                if (metadata.data == undefined) {
+                    res.send({ docs: undefined });
+                } else {
+                    const json = processDocs(req.body, metadata.data.docs);
+                    res.send({ docs: json });
+                }
+            })
+            .catch(err => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createPostRoute(serverContext, '/requestAccessForContentDocument', (req, res) => {
+        const credentials = {
+            user: serviceUser,
+            authentication: serviceToken
+        };
+        requestAccess(serverContext, credentials, req, compileContentDocumentMessageForAPIRequest(req))
+            .then((status: boolean) => {
+                res.send(status);
+            })
+            .catch(err => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createPostRoute(serverContext, '/requestAccess', (req, res) => {
+        const credentials = {
+            user: serviceUser,
+            authentication: serviceToken
+        };
+        requestAccess(serverContext, credentials, req, compileEmailMessageForAPIRequest(req))
+            .then((status: boolean) => {
+                res.send(status);
+            })
+            .catch(err => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createPostRoute(serverContext, '/reportError', (req, res) => {
+        const credentials = {
+            user: serviceUser,
+            authentication: serviceToken
+        };
+        reportError(serverContext, credentials, req)
+            .then((status: boolean) => {
+                res.send(status);
+            })
+            .catch(err => {
+                res.send(err);
+            });
+    });
+    WSRoutes.createGetRoute(serverContext, '/cookie', (req, res) => {
+        const cookie = WSServerUtils.getCookie(req, 'authorization');
+        const authenticationCookie = WSServerUtils.getCookie(req, 'authentication');
+        if (authenticationCookie) {
+            res.send(encodeURIComponent(authenticationCookie));
+        } else {
+            res.send(encodeURIComponent(cookie));
+        }
+    });
+    WSRoutes.createGetRoute(serverContext, '/code', ({}, res) => {
+        const code = loadCode();
+        res.send(code);
+    });
+    cacheHowItWorks(serverContext);
+}
+
+let _apiCardInfo: any = {};
+function cacheHowItWorks(serverContext: IServerContext) {
+    getServiceInfoFromKeyCloak(serverContext)
+        .then(() => {
+            getMetadata(serverContext, '/docs')
+                .then((metadata: any) => {
+                    if (metadata.data == undefined) {
+                        console.error('unable to get /docs');
+                    } else {
+                        for (let i = 0; i < metadata.data.length; i++) {
+                            const api = metadata.data[i];
+                            if (api.docs != undefined) {
+                                _apiCardInfo[api.id] = {};
+                                if (api.docs.howitworks != undefined && api.docs.howitworks.length > 0)
+                                    _apiCardInfo[api.id].howitworks = api.docs.howitworks;
+                                if (api.docs.overview != undefined && api.docs.overview.length > 0) _apiCardInfo[api.id].overview = api.docs.overview;
+                            }
+                        }
+                    }
+                })
+                .catch(err => {
+                    console.error(err);
+                });
+        })
+        .catch(e => {
+            console.log('************ Error ********* : ${e.stack || e.data || e}');
+            if (isLocal) {
+                console.log(
+                    '*** add/update your user to the passmanger to access the password for this service account or copy the pwd and use in the below method for local development and run the login app locally to get the service token ******'
+                );
+            }
+            process.exit(1);
+        });
+}
+
+function getServiceInfoFromKeyCloak(serverContext: IServerContext): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const cmd = '/usr/sbin/retrvPassmanager ${serviceUser}';
+        let userPwd = exec(cmd, { silent: true }).stdout;
+        userPwd = userPwd?.trim();
+        if (!userPwd || userPwd === null) {
+            reject('Could not retrive password from passmanager');
+        }
+        if (serviceToken !== undefined) resolve(serviceToken);
+        else {
+            const url = WSServer.extract(serverContext, 'loginApp') as string;
+            const config = {
+                payload: {
+                    Username: serviceUser,
+                    Password: userPwd,
+                    isServiceAccount: true
+                }
+            };
+            const wsRestInstance = new WSRest(WSRest.defaultJsonConfig);
+            wsRestInstance.post(url, config).then((response: any) => {
+                if (response.data === undefined || response.data.SM_SSOToken === undefined) {
+                    reject('unable to get service account token');
+                } else {
+                    serviceToken = response.data.SM_SSOToken;
+                    resolve(serviceToken!);
+                }
+            });
+        }
+    });
+}
+
+function getMetadata(serverContext: IServerContext, uri: string, req?: any): Promise<WSRestResponseType> {
+    const url = WSServer.extract(serverContext, 'metadata') + uri;
+    const wsRestInstance = new WSRest(WSRest.defaultJsonConfig);
+    let config: any = {};
+    if (req != undefined) {
+        config = { headers: WSServerUtils.createRequestHeaders(req) };
+        delete config.headers.userDN;
+    } else {
+        // in this case - we are trying to request - using our service account
+        config.headers = { user: serviceUser, authentication: serviceToken };
+    }
+    return wsRestInstance.get(url, config);
+}
+
+function isInternalUser(headers: any): boolean {
+    const userName = headers.emulateduser || headers.user;
+    if (userName.indexOf('@virtu.com') !== -1 || userName == serviceUser) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+function queryIsDemo(req: any): boolean {
+    // if we are in demo mode - then assume user is external - and only show external APIs
+    const isDemo: string = req.headers.demo == undefined ? 'false' : req.headers.demo;
+    if (isDemo == 'true') return true;
+    return false;
+}
+function removePrivateAccess(metadata: any): boolean {
+    // if we are here - means that user is external - iterate through methods on this endpoint - and determine if access level is public/protected - if so allow - if private remove
+    // if all method are removed - then return false - we do not need to even show this endpoint - (however if even 1 method exists on this endpoint - then return true) - and we display it to the user
+    const transports = [];
+    for (let i = 0; i < metadata.transports.length; i++) {
+        const protocols = metadata.transports[i];
+        const protocolCount = Object.keys(protocols).length;
+        let deleteProtocolCount = 0;
+        for (const protocol in protocols) {
+            const internalTransports = protocols[protocol];
+            const internalTransportCount = Object.keys(internalTransports).length;
+            let deleteInternalTransportCount = 0;
+            for (const internalTransport in internalTransports) {
+                const methodDefinitions = internalTransports[internalTransport];
+                const methodCount = Object.keys(methodDefinitions).length;
+                let deleteMethodCount = 0;
+                for (const method in methodDefinitions) {
+                    const methodDefinition = methodDefinitions[method];
+                    if (methodDefinition.access == 'PRIVATE') {
+                        delete methodDefinitions[method];
+                        deleteMethodCount++;
+                    }
+                }
+                if (deleteMethodCount == methodCount) {
+                    delete internalTransports[internalTransport];
+                    deleteInternalTransportCount++;
+                }
+            }
+            if (deleteInternalTransportCount == internalTransportCount) {
+                delete protocols[protocol];
+                deleteProtocolCount++;
+            }
+        }
+        if (deleteProtocolCount != protocolCount) {
+            transports.push(protocols);
+        }
+    }
+    if (transports.length > 0) {
+        metadata.transports = transports;
+        return true;
+    }
+    return false;
+}
+
+function processEndpoints(serverContext: IServerContext, serviceMetadata: any, userMetadata: any, isDemo: boolean): any {
+    // we need to create a hash - userMetadata - is all metadata that user can see - the difference with serviceMetadata is what he can't see (doesn't have access to...)
+    let userEndPoints: any = [];
+    let endPoints: any = [];
+    const userAccess: any = {};
+    try {
+        const internal = !isDemo && isInternalUser(userMetadata.config.headers);
+        if (internal) userEndPoints = userMetadata.data;
+        else {
+            userMetadata.data.forEach((metadata: any) => {
+                const keepEndpoint = removePrivateAccess(metadata);
+                if (keepEndpoint) userEndPoints.push(metadata);
+            });
+        }
+        if (internal) endPoints = serviceMetadata.data;
+        else {
+            serviceMetadata.data.forEach((metadata: any) => {
+                const keepEndpoint = removePrivateAccess(metadata);
+                if (keepEndpoint) endPoints.push(metadata);
+            });
+        }
+
+        // we need to create a hash - userMetadata - is all metadata that user can see - the difference with serviceMetadata is what he can't see (doesn't have access to...)
+        userEndPoints.forEach((metadata: any) => {
+            userAccess[metadata.id] = metadata.id;
+        });
+
+        // update with card info descriptions...
+        endPoints.forEach((endPoint: any) => {
+            if (_apiCardInfo[endPoint.id] != undefined) {
+                endPoint.howitworks = _apiCardInfo[endPoint.id].howitworks;
+                endPoint.overview = _apiCardInfo[endPoint.id].overview;
+            }
+        });
+        // update with generated docgen under /local/itg/docs/...
+        // these endpoints are generated from build system (typedocs)
+        if (internal) addDocGenEndpoints(serverContext, endPoints, userAccess);
+    } catch {}
+
+    return {
+        endPoints,
+        userAccess
+    };
+}
+
+function addDocGenEndpoints(serverContext: IServerContext, endPoints: any[], userAccess: any) {
+    // look for folders under docgenPath ... and read names ...these will be doc gen endpoints
+    const docGenPath = serverContext.config.docGenPath;
+    if (docGenPath == undefined || !fs.existsSync(docGenPath)) return;
+
+    const getDirectories = (source: string) =>
+        fs
+            .readdirSync(source, { withFileTypes: true })
+            .filter(dirent => dirent.isDirectory())
+            .map(dirent => dirent.name);
+    const folders = getDirectories(docGenPath);
+    if (folders.length == 0) return;
+    folders.forEach((name: string) => {
+        const id = name + '_docgen';
+        const endPoint = createDocGenEndpoint(id, name);
+        endPoints.push(endPoint);
+        userAccess[id] = id;
+    });
+}
+
+function createDocGenEndpoint(id: string, name: string) {
+    const endPoint = {
+        id,
+        namespace: 'apigateway',
+        subNamespace: name,
+        howitworks: 'code documentation via docGen',
+        customData: {
+            endpoint: id,
+            docs: {
+                category: name,
+                type: 'DOCUMENTATION'
+            }
+        },
+        type: 'external'
+    };
+    return endPoint;
+}
+
+let cachedCode: any = null;
+function loadCode(): any {
+    if (cachedCode !== null) return cachedCode;
+    cachedCode = {
+        javascript: {
+            get: _loadCode('javascript/get.js'),
+            put: _loadCode('javascript/put.js'),
+            post: _loadCode('javascript/post.js'),
+            delete: _loadCode('javascript/delete.js'),
+            stream: _loadCode('javascript/stream.js')
+        },
+        csharp: {
+            get: _loadCode('csharp/get.cs'),
+            put: _loadCode('csharp/put.cs'),
+            post: _loadCode('csharp/post.cs'),
+            delete: _loadCode('csharp/delete.cs'),
+            stream: _loadCode('csharp/stream.cs')
+        },
+        python: {
+            get: _loadCode('python/get.py'),
+            put: _loadCode('python/put.py'),
+            post: _loadCode('python/post.py'),
+            delete: _loadCode('python/delete.py'),
+            stream: _loadCode('python/stream.py')
+        },
+        java: {
+            get: _loadCode('java/get.java'),
+            put: _loadCode('java/put.java'),
+            post: _loadCode('java/post.java'),
+            delete: _loadCode('java/delete.java'),
+            stream: _loadCode('java/stream.java')
+        },
+        portal: {
+            get: _loadCode('portal/get.js'),
+            put: _loadCode('portal/put.js'),
+            post: _loadCode('portal/post.js'),
+            delete: _loadCode('portal/delete.js'),
+            stream: _loadCode('portal/stream.js')
+        },
+        r: {
+            get: _loadCode('r/get.r'),
+            put: _loadCode('r/put.r'),
+            post: _loadCode('r/post.r'),
+            delete: _loadCode('r/delete.r'),
+            stream: _loadCode('r/stream.r')
+        }
+    };
+    return cachedCode;
+}
+
+function _loadCode(filename: string): string {
+    const examplesPath = path.join(__dirname, '../assets/examples');
+    return fs.readFileSync(path.join(examplesPath, filename), 'utf8');
+}
+
+function processDocs(request: any, docs: IDocs): IDocs | null {
+    if (docs.definitions !== undefined) {
+        if (!Array.isArray(docs.definitions)) {
+            WSLogger.error('docs for: ${JSON.stringify(request)}, not properly defined - definitions is not an array - see IDocs for reference');
+            return null;
+        }
+        docs.definitions.forEach((definition: IDocsDefinition) => {
+            // iterate through values for each row - if value is an array - then determine if item is of type IDocsLink - make that special - else just do a simple join(',) on the array
+            const linkColumns: string[] = [];
+            definition.rows.forEach((row: any) => {
+                for (const [key, value] of Object.entries(row)) {
+                    if (Array.isArray(value) && value.length > 0) {
+                        // looks like this is not a simple string - therefore we need a custom renderer for this (note: each object in js has a native link - so we look if string type)
+                        if (typeof (value[0] as IDocsLink).link === 'string') {
+                            // looks like it has of type IDocsLink
+                            linkColumns.push(key);
+                        } else row[key] = value.join(',');
+                    } else {
+                        if (typeof (value as IDocsLink).link === 'string') {
+                            // looks like it has of type IDocsLink
+                            linkColumns.push(key);
+                        }
+                    }
+                }
+            });
+            // first row is kinda like excel header (on client side we use this to generate the grid column 'schema') - as such we can add this column
+            if (linkColumns.length > 0) definition.rows[0]['_linkedCol_'] = linkColumns;
+        });
+    }
+
+    return docs;
+}

@@ -1,0 +1,498 @@
+// @ts-nocheck
+const _ = require('lodash');
+const XLSX = require('xlsx');
+const moment = require('moment');
+const CONSTANTS = require('../../common/constants');
+const { kdbQuery } = require('../../common/kdb-utils');
+const { createRequestHeaders } = require('../../common/utils');
+const { WSRoutes, WSServer, WSServerUtils, isLocal } = require('@ws/ws-server');
+const { createStartHash, handleError, userLog, LOG_LEVELS } = require('../../common/server-utils');
+const { api } = require('../../common/entitlements');
+const { enumApi } = require('../../graphql/schemas/enumeration-schema');
+const sanitizeFilename = require('sanitize-filename');
+
+let numberOfQuarters = 4;
+let roles;
+let fields;
+const analyticsSubPath = isLocal ? '' : '/analytics';
+module.exports = {
+    register: function (serverContext) {
+        WSRoutes.createGetRoute(
+            serverContext,
+            '/13f',
+            (req, res) => {
+                const headers = createRequestHeaders(req);
+                if (headers && headers.user && (headers.authorization || headers.authentication)) {
+                    _hasEntitlements(serverContext, req, '13F Entry')
+                        .then(response => {
+                            if (response === true) {
+                                const domain = isLocal ? 'http://localhost:5004' : req.protocol + '://' + req.headers.host + analyticsSubPath;
+                                WSServerUtils.serverRedirect(res, domain + '/13fquarters');
+                            } else {
+                                res.setHeader('Content-Type', 'text/html');
+                                res.send('<h4>You are not entitled to view this page!</h4>');
+                            }
+                        })
+                        .catch(e => redirectToLogin(req, res));
+                } else {
+                    redirectToLogin(req, res);
+                }
+            },
+            false
+        );
+        WSRoutes.createGetRoute(serverContext, '/13freport', (req, res) => {
+            let funcCtx = '/13freport';
+            const startHash = createStartHash();
+            userLog(LOG_LEVELS.INFO, req, { msg: 'Initiating 13f report generation' }, startHash);
+            _generate13fReport(serverContext, req)
+                .then(response => {
+                    userLog(LOG_LEVELS.INFO, req, { msg: '13f report generated successfully' }, startHash);
+                    const filename = _getFileName(req);
+                    res.setHeader('Content-Disposition', 'attachment; filename=' + filename);
+                    res.setHeader('Content-type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+                    res.send(new Buffer(response));
+                })
+                .catch(error => {
+                    const msg = 'Exception while generating 13f report';
+                    handleError(serverContext, error, res, false, null, funcCtx, msg, req, startHash);
+                });
+        });
+
+        WSRoutes.createGetRoute(serverContext, '/13fquarters', (req, res) => {
+            let funcCtx = '/13fquarters';
+            const startHash = createStartHash();
+            try {
+                // Get current date
+                const today = moment();
+                const thisQuarter = moment().quarter();
+                const endOfCurrQtr = moment().quarter(thisQuarter).endOf('quarter');
+                let currentQuarter;
+
+                const quarters = [];
+
+                if (today.isSame(endOfCurrQtr, 'day')) {
+                    quarters.push(_getQuarterFromMoment(today));
+                }
+                currentQuarter = endOfCurrQtr;
+
+                const ctr = quarters.length;
+
+                // calculate 4 (configurable) quarters from today
+                const quatersCount = req.query.limit !== undefined ? req.query.limit : numberOfQuarters;
+                for (let i = ctr; i < quatersCount; i++) {
+                    const prevQuarter = currentQuarter.clone().subtract(1, 'quarter').endOf('quarter');
+                    quarters.push(_getQuarterFromMoment(prevQuarter));
+                    currentQuarter = prevQuarter;
+                }
+                const msg = 'Generated "${quarters.length}" quarters';
+                userLog(LOG_LEVELS.INFO, req, msg, startHash);
+                _convertAndSend(res, quarters, CONSTANTS.CALL_13F.CALL_TYPE.QUARTERS);
+                // return list back
+                // res.send({ quarters });
+            } catch (err) {
+                const msg = 'Runtime exception while generating quarters';
+                handleError(serverContext, err, res, false, null, funcCtx, msg, req, startHash);
+            }
+        });
+
+        WSRoutes.createGetRoute(serverContext, '/13fclients', (req, res) => {
+            let funcCtx = '/13fclients';
+            const startHash = createStartHash();
+            const callContext = '13F ClientNames call';
+            const _handleError = (err, details) => {
+                const msg = {
+                    details,
+                    context: callContext
+                };
+                handleError(serverContext, err, res, false, null, funcCtx, msg, req, startHash);
+            };
+            if (req.query.date === undefined) {
+                _handleError('Date not found in request');
+                return;
+            }
+
+            // Get Entitlements
+            _hasEntitlements(serverContext, req, callContext)
+                .then(result => {
+                    if (result === true) {
+                        // Make Ref++ call
+                        _makeRefCall(serverContext, req, CONSTANTS.CALL_13F.CALL_TYPE.ACCOUNTS)
+                            .then(response => {
+                                if (response && _.isArray(response)) {
+                                    const filteredResponse = response.filter(item => item.report_period === _formatDate(req.query.date));
+                                    const msg = {
+                                        msg: 'Retrieved client names successfully',
+                                        noOfClients: filteredResponse.length,
+                                        context: callContext
+                                    };
+                                    userLog(LOG_LEVELS.INFO, req, msg, startHash);
+                                    // Return list of client names
+                                    // res.send(filteredResponse);
+                                    _convertAndSend(res, filteredResponse, CONSTANTS.CALL_13F.CALL_TYPE.ACCOUNTS);
+                                } else {
+                                    let reason, details;
+                                    if (response && response.data) {
+                                        reason = 'in unexpected format';
+                                        details = response.data;
+                                    } else {
+                                        reason = 'is undefined';
+                                        details = response;
+                                    }
+                                    _handleError(details, 'Response from reference data ${reason}');
+                                }
+                            })
+                            .catch(err => _handleError(err, 'Error retrieving information from reference data'));
+                    }
+                })
+                .catch(err => _handleError(err, 'Error retrieving entitlements'));
+        });
+    }
+};
+
+function redirectToLogin(req, res) {
+    const loginPath = WSServer._config.loginPath
+        ? req.headers.host + WSServer._config.loginPath
+        : isLocal
+        ? 'localhost:5001/login'
+        : req.headers.host + '/login';
+
+    const url = req.protocol + '://' + loginPath + '?referrer=' + req.protocol + '://' + req.headers.host + analyticsSubPath + req.originalUrl;
+    WSServerUtils.serverRedirect(res, url);
+}
+
+function _convertAndSend(res, data, type) {
+    const css = '<style>
+                    h2{font-family: Cambria; font-size: 20px}
+                    h4 {font-family: Cambria; font-size: 15px; margin-bottom: 0px; padding-left: 5px}
+                    table, td, a {font-family: Tahoma; font-size: 12px}
+                    .changeQtrLink {padding-left:5px; padding-bottom:20px;}
+                </style>';
+    const header = '<h2>13F Report Generation</h2><hr/>';
+    if (type === CONSTANTS.CALL_13F.CALL_TYPE.QUARTERS) {
+        const result = ['<html>'];
+        result.push(css);
+        result.push('<body>');
+        result.push(header);
+        result.push('<table>');
+        for (const eachItem of data) {
+            result.push('<tr><td><a href="${analyticsSubPath}/13fclients?date=${eachItem.value}">${eachItem.label}</a></td></tr>');
+        }
+        result.push('</table></html>');
+        res.setHeader('Content-type', 'text/html');
+        res.send(result.join(''));
+    } else if (type === CONSTANTS.CALL_13F.CALL_TYPE.ACCOUNTS) {
+        const result = ['<html>'];
+        result.push(css);
+        result.push('<body>');
+        result.push(header);
+        result.push('<h4>
+                <script>
+                try {
+                    var params = window.location.search;
+                    if (params.indexOf('?') === 0) {
+                        params = params.substr(1);
+                    }
+                    var year, qtr;
+                    var paramsArr = params.split("&");
+                    for (var i=0; i<paramsArr.length; i++) {
+                        var eachParams = paramsArr[i].split('=');
+                        if (eachParams.length === 2 && eachParams[0] === 'date' && eachParams[1]) {
+                            var dateArr = eachParams[1].split('-');
+                            if (dateArr.length === 3) {
+                                year = dateArr[0];
+                                qtr = Math.ceil(Number(dateArr[1])/3);
+                            }
+                        }
+                    }
+                    if (year && qtr) {
+                        document.write(year + ' Q' + qtr);
+                    }
+                }
+                catch(ignore){}
+                </script>
+                </h4>');
+        result.push('<div class="changeQtrLink"><a href="${analyticsSubPath}/13fquarters">Change Quarter</a><br/></div>');
+        result.push('<table>');
+        data = _.sortBy(data, ['company_name']);
+        for (const eachItem of data) {
+            result.push(
+                '<tr><td><a href="${analyticsSubPath}/13freport?date=${eachItem.report_period}&client=${encodeURIComponent(eachItem.company_name)}">${
+                    eachItem.company_name
+                }</a></td></tr>'
+            );
+        }
+        result.push('</table></html>');
+        res.setHeader('Content-type', 'text/html');
+        res.send(result.join(''));
+    } else {
+        res.send(data);
+    }
+}
+
+function _getFileName(req) {
+    let filename = '13F-Report';
+
+    try {
+        if (req.query.date) {
+            const formatted = _formatDate(req.query.date);
+            if (formatted) {
+                filename += '-' + formatted;
+            }
+        }
+        if (req.query.client) {
+            let cleanClientName = req.query.client;
+            cleanClientName = cleanClientName.replace(/[/\\?%*:|"<>,]/g, '');
+            filename += '-' + cleanClientName;
+        }
+    } catch (ignore) {}
+
+    filename += '.xlsx';
+
+    return sanitizeFilename(filename);
+}
+
+function _formatDate(str) {
+    const date = String(str).trim();
+    const match = date.match(/^((19|20)?\d{2})\W([0-1]?\d)\W([0-3]?\d)$/);
+    if (match) {
+        return '${match[1]}-${match[3]}-${match[4]}';
+    }
+}
+
+function _hasEntitlements(serverContext, req, callContext) {
+    const funcCtx = WSServerUtils.getFuncCtx(_hasEntitlements, arguments, __filename);
+    return new Promise((resolve, reject) => {
+        const startHash = createStartHash();
+        const _handleError = (err, details) => {
+            handleError(serverContext, err, null, false, reject, funcCtx, details, req, startHash);
+        };
+
+        const msg = { msg: 'Checking entitlements', context: callContext };
+        userLog(LOG_LEVELS.INFO, req, msg, startHash);
+        _getEnum(serverContext, req)
+            .then(roles => {
+                const payload = { accessFor13F: roles };
+                const msg = { msg: 'Retrieved enumerations successfully', context: callContext };
+                userLog(LOG_LEVELS.INFO, req, msg, startHash);
+                // Check entitlements
+                api.checkEntitlements(serverContext, req, payload)
+                    .then(response => {
+                        const msg = { msg: 'Retrieved entitlements successfully', context: callContext };
+                        userLog(LOG_LEVELS.INFO, req, msg, startHash);
+                        resolve(response.accessFor13F === true);
+                    })
+                    .catch(err => _handleError(err, 'Error retrieving entitlements'));
+            })
+            .catch(err => _handleError(err, 'Error retrieving enumerations'));
+    });
+}
+
+function _getEnum(serverContext, req) {
+    const funcCtx = WSServerUtils.getFuncCtx(_getEnum, arguments, __filename);
+    return new Promise((resolve, reject) => {
+        if (roles) {
+            resolve(roles);
+        } else {
+            const query = { key: CONSTANTS.ENUMERATIONS.ENUM_13F };
+            const startHash = createStartHash();
+            const msg = { msg: 'Getting enumeration', details: query };
+            userLog(LOG_LEVELS.INFO, req, msg, startHash);
+            enumApi(serverContext, req, query).then(response => {
+                try {
+                    if (response && response[0] && response[0].value) {
+                        const enums13f = JSON.parse(response[0].value);
+                        if (enums13f.numberOfQuarters) {
+                            numberOfQuarters = enums13f.numberOfQuarters;
+                        }
+                        if (enums13f.fields) {
+                            fields = enums13f.fields;
+                        }
+                        const msg = { msg: 'Retrieved enumerations successfully', details: query, response: enums13f };
+                        userLog(LOG_LEVELS.INFO, req, msg, startHash);
+                        roles = enums13f.roles;
+                        resolve(enums13f.roles);
+                    } else {
+                        const details = 'Response from enumeration service in unexpected format';
+                        handleError(serverContext, response, null, null, reject, funcCtx, details, req, startHash);
+                    }
+                } catch (err) {
+                    const msg = 'Runtime error while parsing enumeration response.';
+                    handleError(serverContext, err, null, null, reject, funcCtx, msg, req, startHash);
+                }
+            });
+        }
+    });
+}
+
+function _getQuery(type, props) {
+    if (type === CONSTANTS.CALL_13F.CALL_TYPE.ACCOUNTS) {
+        if (props && props.date) {
+            return {
+                endpoint: 'getCustomData',
+                fields: ['report_period', 'company_name'],
+                conditions: [['report_period', '=', props.date]],
+                table: 'sec_client_holdings'
+            };
+        } else {
+            return { error: 'Date is not defined' };
+        }
+    } else if (type === CONSTANTS.CALL_13F.CALL_TYPE.DATA) {
+        if (props && props.date && props.client) {
+            return {
+                endpoint: 'getCustomData',
+                fields: ['symbol', 'description', 'marketCapBand', 'averageVolume[60]', 'lastClose', 'gicsSector'],
+                conditions: [
+                    ['endOfQuarterDate', '=', props.date],
+                    ['client', '=', props.client]
+                ],
+                table: '13FStats'
+            };
+        } else {
+            return { error: 'Date and/or client not defined' };
+        }
+    } else {
+        return undefined;
+    }
+}
+
+function _makeRefCall(serverContext, req, type) {
+    const funcCtx = WSServerUtils.getFuncCtx(_makeRefCall, arguments, __filename);
+    return new Promise((resolve, reject) => {
+        const startHash = createStartHash();
+        const msg = { msg: 'Getting Reference data for 13F', type };
+        userLog(LOG_LEVELS.INFO, req, msg, startHash);
+
+        const query = _getQuery(type, req.query);
+        if (query.error) {
+            reject(query.error);
+        }
+
+        kdbQuery(serverContext, query, CONSTANTS.ENDPOINT.REF_PLUS_PLUS, req).then(response => {
+            if (response && response.data) {
+                const msg = { msg: 'Retrieved Reference data for ENav successfully' };
+                userLog(LOG_LEVELS.INFO, req, msg, startHash);
+                resolve(response.data);
+            } else {
+                const msg = 'Unable to parse the response from reference data.';
+                handleError(serverContext, response.data || response, null, null, reject, funcCtx, msg, req, startHash);
+            }
+        });
+    });
+}
+
+function _getQuarterFromMoment(momentDate) {
+    return { label: momentDate.format('YYYY') + ' Q' + momentDate.format('Q'), value: momentDate.format('YYYY-MM-DD') };
+}
+
+function _generate13fReport(serverContext, req) {
+    const funcCtx = WSServerUtils.getFuncCtx(_generate13fReport, arguments, __filename);
+    return new Promise((resolve, reject) => {
+        const startHash = createStartHash();
+        const callContext = '13F Report Generation';
+        const _handleError = (err, details) => {
+            const msg = {
+                details,
+                context: callContext
+            };
+            handleError(serverContext, err, null, false, reject, funcCtx, msg, req, startHash);
+        };
+        const missingParams = [];
+        if (req.query.date === undefined) {
+            missingParams.push('date');
+        }
+
+        if (req.query.client === undefined) {
+            missingParams.push('client');
+        }
+
+        if (missingParams.length > 0) {
+            const msg = 'Mandatory parameter${missingParams.length > 1 ? 's' : ''} "${missingParams.join('", "')}" are missing in the request';
+            _handleError(msg);
+            return;
+        }
+
+        // Get Entitlements
+        _hasEntitlements(serverContext, req, callContext)
+            .then(result => {
+                if (result === true) {
+                    // Make Ref++ call
+                    _makeRefCall(serverContext, req, CONSTANTS.CALL_13F.CALL_TYPE.DATA)
+                        .then(response => {
+                            const arrBuffer = _createXLSX(response, req.query.date);
+                            if (arrBuffer.error) {
+                                _handleError(arrBuffer.error, 'Exception while generating excel');
+                            } else {
+                                const msg = {
+                                    msg: 'Retrieved client names successfully',
+                                    context: callContext
+                                };
+                                userLog(LOG_LEVELS.INFO, req, msg, startHash);
+                                //convert data into excel
+                                resolve(arrBuffer);
+                            }
+                        })
+                        .catch(err => _handleError(err, 'Error retrieving information from reference data'));
+                }
+            })
+            .catch(err => _handleError(err, 'Error retrieving entitlements'));
+    });
+}
+
+function _createXLSX(response, date) {
+    try {
+        const momentDate = moment(date, 'YYYY-MM-DD');
+        const sheetTitle = 'Traded-${momentDate.format('YYYY')}-Q${momentDate.format('Q')}';
+
+        if (!fields) {
+            return { error: 'Fields not defined in enumeration' };
+        }
+
+        const header = [];
+        const colWidths = [];
+        const start = 65; // Charcode for A
+        let end = start;
+        for (const eachItem of fields) {
+            header.push(eachItem.field);
+            colWidths.push({ wpx: eachItem.width * 0.75 });
+            end++;
+        }
+
+        // Setting width for last three static columns
+        colWidths.push({ wpx: 50 * 0.75 });
+        colWidths.push({ wpx: 203 * 0.75 });
+        colWidths.push({ wpx: 88 * 0.75 });
+
+        // TO remove the last item as arrays are zero-based
+        end--;
+
+        var ws = XLSX.utils.json_to_sheet(response.data, { header });
+
+        ws['!cols'] = colWidths;
+
+        ws['!autofilter'] = { ref: '${String.fromCharCode(start)}1:${String.fromCharCode(end)}${response.data.length + 1}' };
+
+        const summaryFieldsPosition = String.fromCharCode(end + 2);
+
+        const gicsIndex = 14;
+        XLSX.utils.sheet_add_json(ws, response.statsByGicsSector, { origin: '${summaryFieldsPosition}${gicsIndex}' });
+
+        const mktBandIndex = gicsIndex + response.statsByGicsSector.length + 5;
+        XLSX.utils.sheet_add_json(ws, response.statsByMarketCapBand, { origin: '${summaryFieldsPosition}${mktBandIndex}' });
+
+        const statsArr = [];
+        const keys = Object.keys(response.statsOverview);
+        for (const eachKey of keys) {
+            statsArr.push({ label: eachKey, value: response.statsOverview[eachKey] });
+        }
+
+        const statsIndex = mktBandIndex + response.statsByMarketCapBand.length + 5;
+        XLSX.utils.sheet_add_json(ws, statsArr, { origin: '${summaryFieldsPosition}${statsIndex}', skipHeader: true });
+
+        var wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, sheetTitle);
+
+        return XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+    } catch (err) {
+        return { error: err };
+    }
+}
