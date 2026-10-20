@@ -7,7 +7,6 @@ export interface User {
   status: 'Active' | 'Inactive';
   createdAt: string;
 }
-
 // mock-users.ts
 import { User } from './user.model';
 
